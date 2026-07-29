@@ -7,4 +7,7 @@ pub mod protocol;
 
 pub use config::{ConfigError, FStarConfig};
 pub use messages::*;
-pub use process::{FragmentResult, FragmentStatus, FullBufferResult, FStarProcess, ProcessError};
+pub use process::{
+    FStarProcess, FStarProcessControl, FragmentResult, FragmentStatus, FullBufferResult,
+    ProcessError,
+};

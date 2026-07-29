@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 # MCP server framework (paiml-mcp-sdk with streamable HTTP)
-pmcp = { git = "https://github.com/paiml/rust-mcp-sdk", features = ["streamable-http"] }
+pmcp = { git = "https://github.com/paiml/rust-mcp-sdk" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Regex for config env var substitution
 regex = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 # Additional test utilities

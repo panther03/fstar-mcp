@@ -1,189 +1,105 @@
 # F* MCP Server
 
-An MCP (Model Context Protocol) server that provides a front-end for F*'s `--ide` stdio protocol. This enables AI assistants to interact with F* for typechecking, symbol lookup, and other IDE features via the MCP standard.
+An MCP server over F*'s `--ide` protocol. It keeps a verifying process and a
+lax companion process warm for each active file, so agents can edit files on
+disk and request incremental checks without resending the source.
 
-## Features
-
-- **Session Management**: One session per file path with automatic replacement
-- **Full F* IDE Protocol Support**: Typechecking, symbol lookup, and more
-- **Proof Context**: Access proof obligations and goals during typechecking
-
-## Installation
+## Install and run
 
 ```bash
-# Build the server
 cargo build --release
-
-# Run the server
 ./target/release/fstar-mcp
 ```
 
-## MCP Tools
+The transport is stdio, which gives each MCP client its own process and session
+namespace. Add `--verbose` to log F* protocol traffic to stderr.
 
-### `create_session`
+## Recommended workflow
 
-Create a new F* session. All arguments are optional with sensible defaults.
+1. Edit an `.fst` or `.fsti` file using the host's normal editing tools.
+2. Call `typecheck_buffer` with `file_path`. The server reads the file from
+   disk, discovers its project configuration, and creates or reuses a warm
+   session.
+3. Make targeted edits below the verified prefix and check again. The response
+   reports fragment reuse, the last verified line, duration, content hash, and
+   staleness.
+4. Use `lookup_symbol` for fast type and definition queries through the lax
+   companion. Use `get_proof_context` for proof states and `get_status` only
+   when detailed fragment ranges are needed.
 
-**Parameters:**
-- `file_path` (string, optional): Path to the F* file. If omitted, creates a temporary .fst file.
-- `fstar_exe` (string, optional): Path to fstar.exe. Defaults to 'fstar.exe' in PATH.
-- `cwd` (string, optional): Working directory for F*. Defaults to the file's directory.
-- `include_dirs` (array of strings, optional): Include directories (--include paths).
-- `options` (array of strings, optional): F* command-line options (e.g., `['--cache_dir', '.cache']`).
+`content` is an optional unsaved-buffer override for `typecheck_buffer`; disk
+is the default source of truth.
 
-**Returns:**
+## Configuration discovery
+
+For each file, the server uses the first available source:
+
+1. The nearest `*.fst.config.json`, walking toward `workspace_root` when one is
+   provided. `$VAR` and `${VAR}` are expanded in all string values.
+2. `make <File.fst>-in` in the file's directory. `--include` pairs are split
+   from the remaining F* options.
+3. Bare defaults using `fstar.exe` from `PATH`.
+
+Relative executable paths are resolved from the configured `cwd`; executable
+lookup errors identify both the command and working directory. Explicit
+arguments to `create_session` override discovered values.
+
+Example:
+
 ```json
 {
-  "session_id": "uuid",
-  "status": "ok" | "error",
-  "diagnostics": [...],
-  "fragments": [...],
-  "created_at": "2024-01-01T00:00:00Z"
+  "fstar_exe": "bin/fstar.exe",
+  "options": ["--z3rlimit_factor", "2"],
+  "include_dirs": ["lib", "${HOME}/fstar/ulib"]
 }
 ```
 
-### `list_sessions`
+## Tools
 
-List all active F* sessions with status information.
+| Tool | Purpose |
+|---|---|
+| `typecheck_buffer` | Read and check a file, with optional lax/position mode and deadline. Sessions are implicit by client, path, workspace, and configuration. |
+| `check_project` | Check selected files, or all F* files below a workspace, in source dependency order. |
+| `lookup_symbol` | Query type, docs, and definition through the lax companion. |
+| `get_proof_context` | Return proof states from the latest check. |
+| `get_status` | Return detailed fragment ranges from the latest check. |
+| `restart_solver` | Terminate wedged Z3 descendants before restarting both solvers. |
+| `create_session` | Explicitly warm a session without performing an initial full verification. |
+| `update_buffer` | Add an unsaved dependency to both F* virtual file systems. |
+| `list_sessions` | List only sessions owned by the current MCP client. |
+| `close_session` | Close a session owned by the current MCP client. |
 
-**Parameters:** None
+Checks have a 60-second default deadline and return partial progress on expiry.
+When source dependencies change, the next full check uses `reload-deps` and
+lists the changed files. The server also invokes `fstar.exe --dep full` once
+per session when available and supplements it with direct `open`/`include`
+discovery.
 
-**Returns:**
-```json
-{
-  "sessions": [...],
-  "count": 2
-}
-```
+Diagnostics are capped at 20 per file in normal checks and retain F* error
+numbers plus related ranges. Full fragment arrays are available separately via
+`get_status`.
 
-### `typecheck_buffer`
+## Resource and lifecycle settings
 
-Typecheck code in an existing F* session.
-
-**Parameters:**
-- `session_id` (string): Session ID from `create_session`
-- `code` (string): The F* code to typecheck
-- `lax` (boolean, optional): If true, use lax mode (admits all SMT queries). Shortcut for kind='lax'
-- `kind` (string, optional): Typecheck kind - `"full"`, `"lax"`, `"cache"`, `"reload-deps"`, `"verify-to-position"`, `"lax-to-position"`. Default: `"full"`. Overridden by lax=true
-- `to_line` (integer, optional): Line to typecheck to (for position-based kinds)
-- `to_column` (integer, optional): Column to typecheck to (for position-based kinds)
-
-**Returns:**
-```json
-{
-  "status": "ok" | "error",
-  "diagnostics": [...],
-  "fragments": [...]
-}
-```
-
-### `update_buffer`
-
-Add or update a file in F*'s virtual file system (vfs-add).
-
-**Parameters:**
-- `session_id` (string): Session ID from `create_session`
-- `file_path` (string): Path to the file in the virtual file system
-- `contents` (string): Contents of the file
-
-**Returns:**
-```json
-{
-  "status": "ok" | "error"
-}
-```
-
-### `lookup_symbol`
-
-Look up type information, documentation, and definition location for a symbol.
-
-**Parameters:**
-- `session_id` (string): Session ID from `create_session`
-- `file_path` (string): Path to the file containing the symbol
-- `line` (integer): Line number (1-based)
-- `column` (integer): Column number (0-based)
-- `symbol` (string): The symbol to look up
-
-**Returns:**
-```json
-{
-  "kind": "symbol" | "module" | "not_found",
-  "name": "FStar.List.map",
-  "type_info": "('a -> 'b) -> list 'a -> list 'b",
-  "documentation": "...",
-  "defined_at": {
-    "file": "...",
-    "start_line": 1,
-    "start_column": 0,
-    "end_line": 1,
-    "end_column": 10
-  }
-}
-```
-
-### `get_proof_context`
-
-Get proof obligations and goals at a position. Returns proof states collected during last typecheck.
-
-**Parameters:**
-- `session_id` (string): Session ID from `create_session`
-- `line` (integer, optional): Line number to get proof state at. If omitted, returns all proof states.
-
-**Returns:**
-```json
-{
-  "found": true,
-  "line": 10,
-  "proof_state": {...}
-}
-```
-
-Or when no line is specified:
-```json
-{
-  "count": 3,
-  "proof_states": [...]
-}
-```
-
-### `restart_solver`
-
-Restart the Z3 SMT solver for a session.
-
-**Parameters:**
-- `session_id` (string): Session ID from `create_session`
-
-**Returns:**
-```json
-{
-  "status": "ok"
-}
-```
-
-### `close_session`
-
-Close an F* session and clean up resources.
-
-**Parameters:**
-- `session_id` (string): Session ID from `create_session`
-
-**Returns:**
-```json
-{
-  "status": "ok"
-}
-```
+| Variable | Default | Meaning |
+|---|---:|---|
+| `FSTAR_MCP_MAX_SESSIONS` | `4` | Maximum concurrent full/lax process pairs; least-recently-used idle sessions are evicted. |
+| `FSTAR_MCP_IDLE_TIMEOUT` | `1800` | Idle seconds before an unowned session is swept. |
+| `FSTAR_MCP_SWEEP_PERIOD` | `300` | Seconds between cleanup sweeps. |
+Each stdio server instance namespaces sessions by canonical path and effective
+configuration. Explicit session IDs are unguessable capabilities, and every
+session-taking tool verifies them before use.
 
 ## Development
 
 ```bash
-# Run tests
 cargo test
-
-# Run with debug logging
-RUST_LOG=fstar_mcp=debug cargo run
 ```
 
-## License
+The protocol tests use an executable fake F* process to exercise streamed
+query IDs, response buffering, cancellation, and partial timeouts. A real-F*
+smoke test is included but ignored by default:
 
-MIT
+```bash
+cargo test --test fstar_process_tests real_fstar_typechecks_a_fixture -- --ignored
+```

@@ -8,6 +8,7 @@ use tokio::process::ChildStdin;
 use tokio::sync::Mutex;
 
 /// JSON-L interface for communicating with F* IDE process
+#[derive(Clone)]
 pub struct JsonlInterface {
     writer: Arc<Mutex<ChildStdin>>,
 }
@@ -23,11 +24,11 @@ impl JsonlInterface {
     pub async fn send_message(&self, msg: &serde_json::Value) -> std::io::Result<()> {
         let mut writer = self.writer.lock().await;
         let json = serde_json::to_string(msg)?;
-        
+
         if is_verbose() {
             tracing::info!("[F* ← MCP] {}", json);
         }
-        
+
         writer.write_all(json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
@@ -49,7 +50,10 @@ pub enum FStarResponse {
         ranges: Option<FStarRange>,
     },
     /// Proof state (from tactics)
-    ProofState(IdeProofState),
+    ProofState {
+        query_id: String,
+        proof_state: IdeProofState,
+    },
     /// Error/warning/info message
     StatusMessage {
         #[allow(dead_code)]
@@ -109,7 +113,10 @@ pub fn parse_response(line: &str) -> Result<FStarResponse, serde_json::Error> {
                 "proof-state" => {
                     let contents = value.get("contents").cloned().unwrap_or_default();
                     let proof_state: IdeProofState = serde_json::from_value(contents)?;
-                    Ok(FStarResponse::ProofState(proof_state))
+                    Ok(FStarResponse::ProofState {
+                        query_id,
+                        proof_state,
+                    })
                 }
                 "error" | "warning" | "info" => {
                     let contents = value
@@ -160,7 +167,9 @@ mod tests {
         let line = r#"{"query-id":"1","kind":"message","level":"progress","contents":{"stage":"full-buffer-started"}}"#;
         let response = parse_response(line).unwrap();
         match response {
-            FStarResponse::Progress { query_id, stage, .. } => {
+            FStarResponse::Progress {
+                query_id, stage, ..
+            } => {
                 assert_eq!(query_id, "1");
                 assert_eq!(stage, "full-buffer-started");
             }

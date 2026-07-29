@@ -1,60 +1,70 @@
 //! Session types for MCP responses.
 
-use crate::fstar::{FragmentResult, FragmentStatus, FStarRange, IdeDiagnostic};
+use crate::fstar::{FStarRange, FragmentResult, FragmentStatus, IdeDiagnostic};
 use serde::{Deserialize, Serialize};
-
-/// Response from create_fstar tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateFStarResponse {
-    pub session_id: String,
-    pub status: String, // "ok" or "error"
-    pub diagnostics: Vec<DiagnosticInfo>,
-    pub fragments: Vec<FragmentInfo>,
-    pub created_at: String,
-}
 
 /// Response from typecheck_buffer tool
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypecheckResponse {
     pub status: String, // "ok" or "error"
+    pub summary: String,
+    pub file_path: String,
+    pub content_hash: String,
+    pub stale: bool,
+    pub timed_out: bool,
+    pub finished: bool,
+    pub reused_fragments: usize,
+    pub total_fragments: usize,
+    pub verified_through_line: u32,
+    pub duration_ms: u128,
+    pub process_restarted: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dependencies_changed: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
     pub diagnostics: Vec<DiagnosticInfo>,
-    pub fragments: Vec<FragmentInfo>,
 }
 
 /// Simplified diagnostic for MCP responses
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticInfo {
     pub level: String,
+    pub number: i32,
     pub message: String,
     pub file: String,
     pub start_line: u32,
     pub start_column: u32,
     pub end_line: u32,
     pub end_column: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub related_locations: Vec<RangeInfo>,
 }
 
 impl From<&IdeDiagnostic> for DiagnosticInfo {
     fn from(diag: &IdeDiagnostic) -> Self {
-        let (file, start_line, start_column, end_line, end_column) = if let Some(range) = diag.ranges.first() {
-            (
-                range.fname.clone(),
-                range.beg.0,
-                range.beg.1,
-                range.end.0,
-                range.end.1,
-            )
-        } else {
-            (String::new(), 0, 0, 0, 0)
-        };
+        let (file, start_line, start_column, end_line, end_column) =
+            if let Some(range) = diag.ranges.first() {
+                (
+                    range.fname.clone(),
+                    range.beg.0,
+                    range.beg.1,
+                    range.end.0,
+                    range.end.1,
+                )
+            } else {
+                (String::new(), 0, 0, 0, 0)
+            };
 
         DiagnosticInfo {
             level: diag.level.clone(),
+            number: diag.number,
             message: diag.message.clone(),
             file,
             start_line,
             start_column,
             end_line,
             end_column,
+            related_locations: diag.ranges.iter().skip(1).map(RangeInfo::from).collect(),
         }
     }
 }
@@ -84,12 +94,6 @@ impl From<&FragmentResult> for FragmentInfo {
             },
         }
     }
-}
-
-/// Response from update_buffer tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UpdateBufferResponse {
-    pub status: String,
 }
 
 /// Response from lookup_symbol tool
@@ -125,16 +129,4 @@ impl From<&FStarRange> for RangeInfo {
             end_column: range.end.1,
         }
     }
-}
-
-/// Response from restart_solver tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RestartSolverResponse {
-    pub status: String,
-}
-
-/// Response from close_session tool
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloseSessionResponse {
-    pub status: String,
 }

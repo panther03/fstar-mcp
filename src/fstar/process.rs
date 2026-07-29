@@ -4,6 +4,7 @@ use crate::fstar::config::FStarConfig;
 use crate::fstar::messages::*;
 use crate::fstar::protocol::{parse_response, FStarResponse, JsonlInterface};
 use crate::is_verbose;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,6 +13,7 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
 
 #[derive(Error, Debug)]
 pub enum ProcessError {
@@ -36,6 +38,7 @@ pub struct FullBufferResult {
     pub fragments: Vec<FragmentResult>,
     pub proof_states: Vec<IdeProofState>,
     pub finished: bool,
+    pub timed_out: bool,
 }
 
 /// Result for a single fragment
@@ -57,10 +60,39 @@ pub enum FragmentStatus {
 pub struct FStarProcess {
     child: Child,
     jsonl: JsonlInterface,
-    query_id: AtomicU64,
+    query_id: Arc<AtomicU64>,
     response_rx: mpsc::Receiver<FStarResponse>,
+    pending_responses: VecDeque<FStarResponse>,
     pub supports_full_buffer: bool,
     pub ide_version: i32,
+}
+
+#[derive(Clone)]
+pub struct FStarProcessControl {
+    jsonl: JsonlInterface,
+    query_id: Arc<AtomicU64>,
+}
+
+impl FStarProcessControl {
+    fn next_query_id(&self) -> String {
+        self.query_id.fetch_add(1, Ordering::SeqCst).to_string()
+    }
+
+    pub async fn cancel(&self, position: (u32, u32)) -> Result<bool, ProcessError> {
+        let query = serde_json::json!({
+            "query-id": self.next_query_id(),
+            "query": "cancel",
+            "args": {
+                "cancel-line": position.0,
+                "cancel-column": position.1
+            }
+        });
+        self.jsonl
+            .send_message(&query)
+            .await
+            .map_err(|e| ProcessError::SendError(e.to_string()))?;
+        Ok(true)
+    }
 }
 
 impl FStarProcess {
@@ -75,25 +107,37 @@ impl FStarProcess {
         let args = config.build_args(&file_path.to_string_lossy(), lax);
 
         if is_verbose() {
-            tracing::info!("[F* spawn] {} {} (cwd: {:?})", fstar_exe, args.join(" "), cwd);
+            tracing::info!(
+                "[F* spawn] {} {} (cwd: {:?})",
+                fstar_exe,
+                args.join(" "),
+                cwd
+            );
         } else {
             tracing::debug!("Spawning F* with args: {:?} in {:?}", args, cwd);
         }
 
-        let mut child = Command::new(&fstar_exe)
-            .args(&args) // Pass all args including --ide
-            .current_dir(&cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ProcessError::ExecutableNotFound(fstar_exe.clone())
-                } else {
-                    ProcessError::SpawnError(e)
+        let mut attempts = 0;
+        let mut child = loop {
+            match Command::new(&fstar_exe)
+                .args(&args)
+                .current_dir(&cwd)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => break child,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ProcessError::ExecutableNotFound(fstar_exe.clone()));
                 }
-            })?;
+                Err(error) if attempts < 3 && is_transient_spawn_error(&error) => {
+                    attempts += 1;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => return Err(ProcessError::SpawnError(error)),
+            }
+        };
 
         let stdin = child.stdin.take().expect("stdin not captured");
         let stdout = child.stdout.take().expect("stdout not captured");
@@ -125,11 +169,11 @@ impl FStarProcess {
                         if trimmed.is_empty() {
                             continue;
                         }
-                        
+
                         if verbose_stdout.load(Ordering::Relaxed) {
                             tracing::info!("[F* → MCP] {}", trimmed);
                         }
-                        
+
                         match parse_response(trimmed) {
                             Ok(response) => {
                                 if tx_clone.send(response).await.is_err() {
@@ -137,7 +181,11 @@ impl FStarProcess {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to parse F* response: {} | raw: {}", e, trimmed);
+                                tracing::warn!(
+                                    "Failed to parse F* response: {} | raw: {}",
+                                    e,
+                                    trimmed
+                                );
                             }
                         }
                     }
@@ -178,8 +226,9 @@ impl FStarProcess {
         let mut process = FStarProcess {
             child,
             jsonl,
-            query_id: AtomicU64::new(0),
+            query_id: Arc::new(AtomicU64::new(1)),
             response_rx: rx,
+            pending_responses: VecDeque::new(),
             supports_full_buffer: true, // Assume true until we get protocol-info
             ide_version: 3,
         };
@@ -221,6 +270,20 @@ impl FStarProcess {
         self.query_id.fetch_add(1, Ordering::SeqCst).to_string()
     }
 
+    pub fn control(&self) -> FStarProcessControl {
+        FStarProcessControl {
+            jsonl: self.jsonl.clone(),
+            query_id: self.query_id.clone(),
+        }
+    }
+
+    pub fn has_exited(&mut self) -> Result<bool, ProcessError> {
+        self.child
+            .try_wait()
+            .map(|status| status.is_some())
+            .map_err(ProcessError::SpawnError)
+    }
+
     /// Send a query and return the query ID
     pub async fn send_query(&self, mut query: serde_json::Value) -> Result<String, ProcessError> {
         let qid = self.next_query_id();
@@ -242,6 +305,7 @@ impl FStarProcess {
         code: &str,
         kind: &str,
         to_position: Option<(u32, u32)>,
+        timeout: Duration,
     ) -> Result<FullBufferResult, ProcessError> {
         if !self.supports_full_buffer {
             return Err(ProcessError::NoFullBufferSupport);
@@ -266,78 +330,78 @@ impl FStarProcess {
         }
 
         let qid = self.send_query(query).await?;
-        let base_qid = qid.clone();
-
         let mut result = FullBufferResult::default();
+        let deadline = Instant::now() + timeout;
 
         // Collect responses until full-buffer-finished
         loop {
-            match self.response_rx.recv().await {
-                Some(FStarResponse::Progress {
-                    query_id,
+            let response = self.recv_matching(&qid, true, deadline).await?;
+            let Some(response) = response else {
+                result.timed_out = true;
+                let position = result
+                    .fragments
+                    .last()
+                    .map(|fragment| fragment.range.beg)
+                    .unwrap_or((1, 0));
+                self.control().cancel(position).await?;
+                break;
+            };
+
+            match response {
+                FStarResponse::Progress {
+                    query_id: _,
                     stage,
                     ranges,
-                }) => {
-                    if !query_id.starts_with(&base_qid) {
-                        continue;
+                } => match stage.as_str() {
+                    "full-buffer-started" => {
+                        tracing::debug!("Full buffer started");
                     }
-
-                    match stage.as_str() {
-                        "full-buffer-started" => {
-                            tracing::debug!("Full buffer started");
-                        }
-                        "full-buffer-finished" => {
-                            result.finished = true;
-                            break;
-                        }
-                        "full-buffer-fragment-started" => {
-                            if let Some(r) = ranges {
-                                result.fragments.push(FragmentResult {
-                                    range: r,
-                                    status: FragmentStatus::InProgress,
-                                });
-                            }
-                        }
-                        "full-buffer-fragment-ok" => {
-                            if let Some(last) = result.fragments.last_mut() {
-                                last.status = FragmentStatus::Ok;
-                            }
-                        }
-                        "full-buffer-fragment-lax-ok" => {
-                            if let Some(last) = result.fragments.last_mut() {
-                                last.status = FragmentStatus::LaxOk;
-                            }
-                        }
-                        "full-buffer-fragment-failed" => {
-                            if let Some(last) = result.fragments.last_mut() {
-                                last.status = FragmentStatus::Failed;
-                            }
-                        }
-                        _ => {}
+                    "full-buffer-finished" => {
+                        result.finished = true;
+                        break;
                     }
-                }
-                Some(FStarResponse::Response(resp)) => {
-                    if !resp.query_id.starts_with(&base_qid) {
-                        continue;
+                    "full-buffer-fragment-started" => {
+                        Self::record_fragment(
+                            &mut result.fragments,
+                            ranges,
+                            FragmentStatus::InProgress,
+                        );
                     }
+                    "full-buffer-fragment-ok" => {
+                        Self::record_fragment(&mut result.fragments, ranges, FragmentStatus::Ok);
+                    }
+                    "full-buffer-fragment-lax-ok" => {
+                        Self::record_fragment(&mut result.fragments, ranges, FragmentStatus::LaxOk);
+                    }
+                    "full-buffer-fragment-failed" => {
+                        Self::record_fragment(
+                            &mut result.fragments,
+                            ranges,
+                            FragmentStatus::Failed,
+                        );
+                    }
+                    _ => {}
+                },
+                FStarResponse::Response(resp) => {
                     // Check for diagnostics in response
                     if let Some(response) = &resp.response {
-                        if let Ok(diags) = serde_json::from_value::<Vec<IdeDiagnostic>>(response.clone()) {
+                        if let Ok(diags) =
+                            serde_json::from_value::<Vec<IdeDiagnostic>>(response.clone())
+                        {
                             result.diagnostics.extend(diags);
                         }
                     }
                 }
-                Some(FStarResponse::ProofState(ps)) => {
-                    result.proof_states.push(ps);
+                FStarResponse::ProofState { proof_state, .. } => {
+                    result.proof_states.push(proof_state);
                 }
-                Some(FStarResponse::StatusMessage { level, contents, .. }) => {
+                FStarResponse::StatusMessage {
+                    level, contents, ..
+                } => {
                     tracing::debug!("F* {}: {}", level, contents);
                 }
-                Some(FStarResponse::ProtocolInfo(_)) => {
+                FStarResponse::ProtocolInfo(_) => {
                     // Ignore late protocol info
-                }
-                None => {
-                    return Err(ProcessError::ProcessExited(None));
                 }
             }
         }
@@ -345,8 +409,64 @@ impl FStarProcess {
         Ok(result)
     }
 
+    fn record_fragment(
+        fragments: &mut Vec<FragmentResult>,
+        range: Option<FStarRange>,
+        status: FragmentStatus,
+    ) {
+        if let Some(range) = range {
+            if let Some(fragment) = fragments.iter_mut().rev().find(|f| f.range == range) {
+                fragment.status = status;
+            } else {
+                fragments.push(FragmentResult { range, status });
+            }
+        } else if let Some(fragment) = fragments.last_mut() {
+            fragment.status = status;
+        }
+    }
+
+    async fn recv_matching(
+        &mut self,
+        query_id: &str,
+        include_subqueries: bool,
+        deadline: Instant,
+    ) -> Result<Option<FStarResponse>, ProcessError> {
+        if let Some(index) = self.pending_responses.iter().position(|response| {
+            response_query_id(response)
+                .map(|response_id| query_id_matches(response_id, query_id, include_subqueries))
+                .unwrap_or(false)
+        }) {
+            return Ok(self.pending_responses.remove(index));
+        }
+
+        loop {
+            let response = match tokio::time::timeout_at(deadline, self.response_rx.recv()).await {
+                Ok(Some(response)) => response,
+                Ok(None) => return Err(ProcessError::ProcessExited(None)),
+                Err(_) => return Ok(None),
+            };
+
+            if response_query_id(&response)
+                .map(|response_id| query_id_matches(response_id, query_id, include_subqueries))
+                .unwrap_or(false)
+            {
+                return Ok(Some(response));
+            }
+
+            if self.pending_responses.len() == 1024 {
+                tracing::warn!("Dropping oldest unmatched F* response");
+                self.pending_responses.pop_front();
+            }
+            self.pending_responses.push_back(response);
+        }
+    }
+
     /// Send a vfs-add query
-    pub async fn vfs_add(&mut self, filename: Option<&str>, contents: &str) -> Result<(), ProcessError> {
+    pub async fn vfs_add(
+        &mut self,
+        filename: Option<&str>,
+        contents: &str,
+    ) -> Result<(), ProcessError> {
         let query = serde_json::json!({
             "query": "vfs-add",
             "args": {
@@ -357,16 +477,11 @@ impl FStarProcess {
 
         let qid = self.send_query(query).await?;
 
-        // Wait for response
-        while let Some(response) = self.response_rx.recv().await {
-            if let FStarResponse::Response(resp) = response {
-                if resp.query_id == qid {
-                    return Ok(());
-                }
-            }
+        let deadline = Instant::now() + Duration::from_secs(15);
+        if let Some(FStarResponse::Response(_)) = self.recv_matching(&qid, false, deadline).await? {
+            return Ok(());
         }
-
-        Err(ProcessError::ProcessExited(None))
+        Err(ProcessError::Timeout)
     }
 
     /// Send a lookup query
@@ -393,37 +508,138 @@ impl FStarProcess {
 
         let qid = self.send_query(query).await?;
 
-        while let Some(response) = self.response_rx.recv().await {
-            if let FStarResponse::Response(resp) = response {
-                if resp.query_id == qid {
-                    if resp.status == Some("success".to_string()) {
-                        if let Some(r) = resp.response {
-                            return Ok(serde_json::from_value(r).ok());
-                        }
-                    }
-                    return Ok(None);
+        let deadline = Instant::now() + Duration::from_secs(15);
+        if let Some(FStarResponse::Response(resp)) =
+            self.recv_matching(&qid, false, deadline).await?
+        {
+            if resp.status.as_deref() == Some("success") {
+                if let Some(r) = resp.response {
+                    return Ok(serde_json::from_value(r).ok());
                 }
+            }
+            return Ok(None);
+        }
+
+        Err(ProcessError::Timeout)
+    }
+
+    #[cfg(unix)]
+    async fn kill_z3_descendants(&self) {
+        let Some(root_pid) = self.child.id() else {
+            return;
+        };
+        let output = match Command::new("ps")
+            .args(["-eo", "pid=,ppid=,comm="])
+            .output()
+            .await
+        {
+            Ok(output) if output.status.success() => output,
+            _ => {
+                tracing::warn!("Could not enumerate F* child processes");
+                return;
+            }
+        };
+
+        let mut processes = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(pid), Some(ppid), Some(command)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            if let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) {
+                processes.push((pid, ppid, command.to_string()));
             }
         }
 
-        Err(ProcessError::ProcessExited(None))
+        let mut descendants = vec![root_pid];
+        let mut index = 0;
+        while index < descendants.len() {
+            let parent = descendants[index];
+            for (pid, ppid, _) in &processes {
+                if *ppid == parent && !descendants.contains(pid) {
+                    descendants.push(*pid);
+                }
+            }
+            index += 1;
+        }
+
+        for (pid, _, command) in processes {
+            if descendants.contains(&pid) && command.starts_with("z3") {
+                tracing::info!(pid, "Terminating wedged Z3 child");
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status()
+                    .await;
+            }
+        }
     }
 
-    /// Send restart-solver request
+    #[cfg(not(unix))]
+    async fn kill_z3_descendants(&self) {}
+
+    /// Send restart-solver request after terminating any wedged Z3 children.
     pub async fn restart_solver(&mut self) -> Result<(), ProcessError> {
+        self.kill_z3_descendants().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         let query = serde_json::json!({
             "query": "restart-solver",
             "args": {}
         });
 
         self.send_query(query).await?;
-        // restart-solver doesn't send a response
         Ok(())
     }
 
-    /// Kill the F* process
+    /// Kill the F* process.
     pub async fn kill(&mut self) -> Result<(), ProcessError> {
+        if self.has_exited()? {
+            return Ok(());
+        }
         self.child.kill().await.map_err(ProcessError::SpawnError)
+    }
+}
+
+fn response_query_id(response: &FStarResponse) -> Option<&str> {
+    match response {
+        FStarResponse::Response(response) => Some(&response.query_id),
+        FStarResponse::Progress { query_id, .. }
+        | FStarResponse::ProofState { query_id, .. }
+        | FStarResponse::StatusMessage { query_id, .. } => Some(query_id),
+        FStarResponse::ProtocolInfo(_) => None,
+    }
+}
+
+fn query_id_matches(response_id: &str, query_id: &str, include_subqueries: bool) -> bool {
+    if include_subqueries {
+        response_id.split('.').next() == Some(query_id)
+    } else {
+        response_id == query_id
+    }
+}
+
+#[cfg(unix)]
+fn is_transient_spawn_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(26)
+}
+
+#[cfg(not(unix))]
+fn is_transient_spawn_error(_error: &std::io::Error) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::query_id_matches;
+
+    #[test]
+    fn query_ids_only_match_exact_roots() {
+        assert!(query_id_matches("1", "1", true));
+        assert!(query_id_matches("1.12", "1", true));
+        assert!(!query_id_matches("10", "1", true));
+        assert!(!query_id_matches("10.1", "1", true));
+        assert!(!query_id_matches("1.1", "1", false));
     }
 }
 

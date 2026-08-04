@@ -10,6 +10,7 @@ use std::process::Command;
 use thiserror::Error;
 
 const CONFIG_SUFFIX: &str = ".fst.config.json";
+const DEFAULT_FSTAR_EXE: &str = "fstar.exe";
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -101,7 +102,23 @@ impl FStarConfig {
 
         let cwd = config.cwd_or(file_parent);
         let executable = config.fstar_exe().to_string();
-        let resolved = resolve_executable(&executable, &cwd)?;
+        let resolved = match resolve_executable(&executable, &cwd) {
+            Ok(resolved) => resolved,
+            // A discovered config often points at a build artifact that was never built
+            // (checked-in `*.fst.config.json` files reference in-tree compiler outputs).
+            // Fall back to PATH, but never override an executable the caller asked for.
+            Err(error) if overrides.fstar_exe.is_none() && executable != DEFAULT_FSTAR_EXE => {
+                let fallback =
+                    resolve_executable(DEFAULT_FSTAR_EXE, &cwd).map_err(|_| error)?;
+                tracing::warn!(
+                    configured = %executable,
+                    fallback = %fallback.display(),
+                    "Configured F* executable not found; falling back to PATH"
+                );
+                fallback
+            }
+            Err(error) => return Err(error),
+        };
         config.fstar_exe = Some(resolved.to_string_lossy().into_owned());
 
         Ok(config)
@@ -109,7 +126,7 @@ impl FStarConfig {
 
     /// Get the F* executable path (with default)
     pub fn fstar_exe(&self) -> &str {
-        self.fstar_exe.as_deref().unwrap_or("fstar.exe")
+        self.fstar_exe.as_deref().unwrap_or(DEFAULT_FSTAR_EXE)
     }
 
     /// Get the working directory (with default)

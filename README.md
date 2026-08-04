@@ -12,7 +12,19 @@ cargo build --release
 ```
 
 The transport is stdio, which gives each MCP client its own process and session
-namespace. Add `--verbose` to log F* protocol traffic to stderr.
+namespace. All logging goes to stderr so it can never corrupt the JSON-RPC
+stream on stdout. Add `--verbose` to log F* protocol traffic to stderr.
+
+Register it with a client, for example the Copilot CLI:
+
+```bash
+copilot mcp add fstar --timeout 600000 -- /path/to/fstar-mcp
+```
+
+Clients that speak MCP revision `2026-07-28` open the lifecycle with a
+`server/discover` request. This server answers unsupported requests with
+`-32601 Method not found`, so such clients fall back to the `initialize`
+handshake instead of dropping the connection.
 
 ## Recommended workflow
 
@@ -41,8 +53,12 @@ For each file, the server uses the first available source:
 3. Bare defaults using `fstar.exe` from `PATH`.
 
 Relative executable paths are resolved from the configured `cwd`; executable
-lookup errors identify both the command and working directory. Explicit
-arguments to `create_session` override discovered values.
+lookup errors identify both the command and working directory. If a discovered
+config names an `fstar_exe` that does not exist — common for checked-in configs
+that point at in-tree compiler builds — the server falls back to `fstar.exe`
+from `PATH` and logs a warning. An `fstar_exe` passed explicitly to
+`create_session` is never overridden this way. Explicit arguments to
+`create_session` override discovered values.
 
 Example:
 

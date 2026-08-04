@@ -1,6 +1,6 @@
 //! F* MCP Server - stdio front-end for F*'s IDE protocol.
 
-use fstar_mcp::mcp::{create_fstar_server, SESSION_MANAGER};
+use fstar_mcp::mcp::{create_fstar_server, DiscoveryAwareStdioTransport, SESSION_MANAGER};
 use fstar_mcp::session::DEFAULT_SWEEP_PERIOD_SECS;
 use fstar_mcp::set_verbose;
 use tracing::info;
@@ -25,6 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| default_filter.into()),
@@ -44,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     info!("Starting F* MCP server over stdio");
-    server.run_stdio().await?;
+    server.run(DiscoveryAwareStdioTransport::new()).await?;
     sweeper_handle.abort();
     SESSION_MANAGER.close_all().await;
     Ok(())
